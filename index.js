@@ -1,3 +1,5 @@
+require('dotenv').config();
+const cron = require('node-cron');
 const express = require('express');
 const cors = require('cors');
 const Database = require('better-sqlite3');
@@ -30,14 +32,19 @@ db.exec(`
     FOREIGN KEY (session_id) REFERENCES sessions(id)
   );
 
-  CREATE TABLE IF NOT EXISTS reponses (
+ CREATE TABLE IF NOT EXISTS reponses (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     apprenant_id INTEGER,
-    question_id INTEGER,
-    reponse TEXT,
-    correct INTEGER,
+    score INTEGER,
+    profil TEXT,
+    reponses_qcm TEXT,
+    objectif TEXT,
+    points_aborder TEXT,
+    points_eviter TEXT,
+    handicap TEXT,
+    questions_libres TEXT,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (apprenant_id) REFERENCES apprenants(id)
+   FOREIGN KEY (apprenant_id) REFERENCES apprenants(id)
   );
 
   CREATE TABLE IF NOT EXISTS questions (
@@ -76,14 +83,40 @@ app.get('/api/apprenant/:token', (req, res) => {
 
 // Soumettre les réponses d'un apprenant
 app.post('/api/reponses', (req, res) => {
-  const { apprenant_id, reponses } = req.body;
-  const insert = db.prepare(
-    'INSERT INTO reponses (apprenant_id, question_id, reponse, correct) VALUES (?, ?, ?, ?)'
+  const {
+    token,
+    score,
+    profil,
+    reponses_qcm,
+    objectif,
+    points_aborder,
+    points_eviter,
+    handicap,
+    questions_libres
+  } = req.body;
+
+  const apprenant = db.prepare('SELECT * FROM apprenants WHERE token = ?').get(token);
+  if (!apprenant) return res.status(404).json({ error: 'Token invalide' });
+
+  const existant = db.prepare('SELECT id FROM reponses WHERE apprenant_id = ?').get(apprenant.id);
+  if (existant) return res.status(409).json({ error: 'Réponses déjà soumises' });
+
+  db.prepare(`
+    INSERT INTO reponses
+      (apprenant_id, score, profil, reponses_qcm, objectif, points_aborder, points_eviter, handicap, questions_libres)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    apprenant.id,
+    score,
+    profil,
+    JSON.stringify(reponses_qcm || []),
+    objectif || '',
+    points_aborder || '',
+    points_eviter || '',
+    handicap || '',
+    questions_libres || ''
   );
-  const insertMany = db.transaction((items) => {
-    for (const r of items) insert.run(apprenant_id, r.question_id, r.reponse, r.correct);
-  });
-  insertMany(reponses);
+
   res.json({ success: true });
 });
 
@@ -158,7 +191,82 @@ app.get('/api/session/:id/qrcodes', async (req, res) => {
   html += '</body></html>';
   res.send(html);
 });
+// Configuration nodemailer
+const nodemailer = require('nodemailer');
 
+const transporter = nodemailer.createTransport({
+  service: 'gmail',
+  auth: {
+    user: process.env.EMAIL_USER,
+    pass: process.env.EMAIL_PASS
+  }
+});
+
+// Route email
+app.post('/api/email/:token', async (req, res) => {
+  const apprenant = db.prepare('SELECT * FROM apprenants WHERE token = ?').get(req.params.token);
+  if (!apprenant) return res.status(404).json({ error: 'Token invalide' });
+
+  const reponse = db.prepare('SELECT * FROM reponses WHERE apprenant_id = ?').get(apprenant.id);
+  if (!reponse) return res.status(404).json({ error: 'Pas de réponses trouvées' });
+
+  try {
+    await transporter.sendMail({
+      from: process.env.EMAIL_USER,
+      to: process.env.EMAIL_USER,
+      subject: `📋 Réponses de ${apprenant.prenom} ${apprenant.nom}`,
+      html: `
+        <h2>Réponses reçues — ${apprenant.prenom} ${apprenant.nom}</h2>
+        <p><strong>Score :</strong> ${reponse.score}/5</p>
+        <p><strong>Profil :</strong> ${reponse.profil}</p>
+        <p><strong>Objectif :</strong> ${reponse.objectif || '—'}</p>
+        <p><strong>Points à aborder :</strong> ${reponse.points_aborder || '—'}</p>
+        <p><strong>Points à éviter :</strong> ${reponse.points_eviter || '—'}</p>
+        <p><strong>Handicap :</strong> ${reponse.handicap || '—'}</p>
+        <p><strong>Questions libres :</strong> ${reponse.questions_libres || '—'}</p>
+      `
+    });
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Erreur email :', err);
+    res.status(500).json({ error: 'Échec envoi email' });
+  }
+});
+// Cron job J+90 — tourne tous les jours à 8h00
+cron.schedule('0 8 * * *', async () => {
+  console.log('Cron J+90 — vérification...');
+
+  const apprenants = db.prepare(`
+    SELECT a.*, r.created_at as repondu_le
+    FROM apprenants a
+    JOIN reponses r ON r.apprenant_id = a.id
+  `).all();
+
+  const maintenant = new Date();
+
+  for (const a of apprenants) {
+    const dateReponse = new Date(a.repondu_le);
+    const joursEcoules = Math.floor((maintenant - dateReponse) / (1000 * 60 * 60 * 24));
+
+    if (joursEcoules === 90) {
+      try {
+        await transporter.sendMail({
+          from: process.env.EMAIL_USER,
+          to: process.env.EMAIL_USER,
+          subject: `📅 Suivi J+90 — ${a.prenom} ${a.nom}`,
+          html: `
+            <h2>Suivi 90 jours — ${a.prenom} ${a.nom}</h2>
+            <p>90 jours se sont écoulés depuis la formation.</p>
+            <p>Pensez à recontacter cet apprenant pour un point de suivi.</p>
+          `
+        });
+        console.log(`Email J+90 envoyé pour ${a.prenom} ${a.nom}`);
+      } catch (err) {
+        console.error(`Erreur J+90 pour ${a.prenom} ${a.nom}:`, err);
+      }
+    }
+  }
+});
 app.listen(PORT, () => {
   console.log(`Serveur démarré sur http://localhost:${PORT}`);
 });
