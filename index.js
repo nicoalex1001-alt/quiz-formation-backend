@@ -6,7 +6,9 @@ const path = require('path');
 const app = express();
 const PORT = 3001;
 
-app.use(cors());
+app.use(cors({
+  origin: 'https://benevolent-pika-d5a8cb.netlify.app'
+}));
 app.use(express.json());
 
 const db = new Database(path.join(__dirname, 'quiz.db'));
